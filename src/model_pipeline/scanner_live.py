@@ -25,8 +25,9 @@ from utils.feature_calculator import (
     SLOPE_WINDOW
 )
 
-TELEGRAM_BOT_TOKEN = '8597751586:AAHdeRMQgCTUtPmfjqrqUztv3pWJNFWMLoc' 
-TELEGRAM_CHAT_ID = '1156807068'
+# --- Telegram Configuration ---
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN') 
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 # --- Global Configuration ---
 # Adjusted path for src/model_pipeline/
