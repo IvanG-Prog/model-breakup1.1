@@ -252,10 +252,10 @@ def send_telegram_alert(message):
             print("✅ Telegram: Alerta enviada con éxito.")
 
     except requests.exceptions.HTTPError as err:
-        print(f"❌ ERROR HTTP al enviar a Telegram: {err}")
-        print(f"Respuesta del servidor: {response.text}")
+        print(f"❌ HTTP ERROR when sending to Telegram: {err}")
+        print(f"Server response: {response.text}")
     except Exception as e:
-        print(f"Error desconocido al enviar la alerta de Telegram: {e}")
+        print(f"Unknown error when sending Telegram alert: {e}")
 
         
 def main():
