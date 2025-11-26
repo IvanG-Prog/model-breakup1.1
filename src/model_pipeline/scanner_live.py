@@ -9,6 +9,7 @@ import pandas as pd
 import joblib
 import os
 import sys
+import requests
 from scipy.stats import linregress 
 from datetime import datetime
 import numpy as np
@@ -23,6 +24,9 @@ from utils.feature_calculator import (
     ATR_PERIOD,
     SLOPE_WINDOW
 )
+
+TELEGRAM_BOT_TOKEN = '8597751586:AAHdeRMQgCTUtPmfjqrqUztv3pWJNFWMLoc' 
+TELEGRAM_CHAT_ID = '1156807068'
 
 # --- Global Configuration ---
 # Adjusted path for src/model_pipeline/
@@ -223,10 +227,37 @@ def predict_and_alert(df_current_features, models):
         RSI: {rsi_value:.2f} | Slope 50: {features['Slope_50']:.2f}
         """
         print(message)
+
+        send_telegram_alert(message)
+
     else:
         print(f"🟡 Prediction found ({best_target}), but Net Advantage ({max_advantage:.2f}%) is below the alert threshold ({MINIMUM_ADVANTAGE_ALERT:.2f}%).")
 
 
+def send_telegram_alert(message):
+    """Sends a message to the configured Telegram chat."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': 'HTML'
+    }
+    try:
+        response = requests.post(url, data=payload)
+        response.raise_for_status() 
+        
+        if response.json().get("ok") == False:
+            print(f"❌ Error en la API de Telegram: {response.json()}")
+        else:
+            print("✅ Telegram: Alerta enviada con éxito.")
+
+    except requests.exceptions.HTTPError as err:
+        print(f"❌ ERROR HTTP al enviar a Telegram: {err}")
+        print(f"Respuesta del servidor: {response.text}")
+    except Exception as e:
+        print(f"Error desconocido al enviar la alerta de Telegram: {e}")
+
+        
 def main():
     """
     Orchestrates the live scanner process: loads models, fetches data, 
