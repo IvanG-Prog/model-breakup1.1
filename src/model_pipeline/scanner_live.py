@@ -10,6 +10,7 @@ import joblib
 import os
 import sys
 import requests
+import asyncio # Necesario para ejecutar main()
 from scipy.stats import linregress 
 from datetime import datetime
 import numpy as np
@@ -28,9 +29,9 @@ from utils.feature_calculator import (
 # --- Telegram Configuration ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN') 
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+TELEGRAM_PROXY_URL = os.environ.get('TELEGRAM_PROXY_URL') 
 
 # --- Global Configuration ---
-# Adjusted path for src/model_pipeline/
 BASE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 MODELS_DIR = os.path.join(BASE_PATH, 'models') 
 
@@ -75,18 +76,18 @@ def calculate_break_even(target_value):
 
 def fetch_live_data_simulation():
     """
-    Fetches the last 100 OHLCV candles from the Binance exchange using ccxt.
-    This replaces the data simulation with a real-time API call for the context 
-    needed to calculate features (e.g., Slope 50).
+    Fetches the last 100 OHLCV candles from the KuCoin exchange using ccxt.
     
     Returns:
         pd.DataFrame: DataFrame containing OHLCV data.
     """
-    exchange_name = 'binance'
+    exchange_name = 'kucoin' 
     symbol = 'ETH/USDT'
     timeframe = '1h'
     limit = 100
 
+    print(f"📡 Fetching live data from {exchange_name}...")
+    
     try:
         exchange_class = getattr(ccxt, exchange_name)
         exchange = exchange_class({'enableRateLimit': True})
@@ -94,7 +95,7 @@ def fetch_live_data_simulation():
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         
         if not ohlcv:
-            print("❌ Error: ccxt no devolvió datos OHLCV.")
+            print(f"❌ Error: ccxt no devolvió datos OHLCV de {exchange_name}.")
             return pd.DataFrame()
         
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -120,6 +121,7 @@ def process_live_features(df_ohlcv_context):
     
     # Ensure the context has enough data
     if len(df_ohlcv_context) < SLOPE_WINDOW:
+        print(f"❌ Insufficient historical data ({len(df_ohlcv_context)} candles) to calculate Slope 50.")
         return pd.DataFrame()
 
     df = df_ohlcv_context.copy()
@@ -162,17 +164,27 @@ def process_live_features(df_ohlcv_context):
     return last_features[feature_cols].to_frame().T.dropna()
 
 
-def predict_and_alert(df_current_features, models):
+async def predict_and_alert(df_current_features, models):
     """
     Predicts the probability for all targets and generates a clear alert 
     message if the maximum Net Advantage exceeds the predefined minimum.
+    
+    Returns:
+        bool: True if an alert was sent, False otherwise.
     """
     if df_current_features.empty:
         print("❌ Insufficient data or feature calculation failed for the current candle.")
-        return
+        return False
 
     timestamp = df_current_features.index[0]
     features = df_current_features.iloc[0]
+    
+    # Check if 'ATR_14' exists before accessing it
+    if 'ATR_14' not in features:
+        print("❌ ATR_14 feature missing from current features.")
+        return False
+        
+    atr_value = features['ATR_14']
     
     print(f"\n--- 🧠 LIVE PREDICTION DIAGNOSTICS: {timestamp} ---")
     
@@ -185,7 +197,7 @@ def predict_and_alert(df_current_features, models):
         direction = 'SHORT'
     else:
         print(f"🟡 Neutral State: RSI ({rsi_value:.2f}). No strong entry predicted.")
-        return
+        return False
     
     max_advantage = -np.inf
     best_target = None
@@ -225,65 +237,100 @@ def predict_and_alert(df_current_features, models):
         📊 P. Prediction: {best_prob:.2f}%
         🟢 Net Advantage: +{max_advantage:.2f}%
         ------------------------------------------
-        RSI: {rsi_value:.2f} | Slope 50: {features['Slope_50']:.2f}
+        RSI: {rsi_value:.2f} | Slope 50: {features['Slope_50']:.2f} | ATR 14: {atr_value:.2f}
         """
         print(message)
 
+        # CORRECTED: Call the synchronous alert function
         send_telegram_alert(message)
+        return True # <-- Signal found and sent
 
     else:
         print(f"🟡 Prediction found ({best_target}), but Net Advantage ({max_advantage:.2f}%) is below the alert threshold ({MINIMUM_ADVANTAGE_ALERT:.2f}%).")
+        return False # <-- Signal rejected
 
 
-def send_telegram_alert(message):
-    """Sends a message to the configured Telegram chat."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        'chat_id': TELEGRAM_CHAT_ID,
-        'text': message,
-        'parse_mode': 'HTML'
-    }
+def send_telegram_alert(message: str):
+    """
+    Sends a message, prioritizing the Proxy URL if defined, otherwise defaulting to direct Telegram API access.
+    """
+    
+    if TELEGRAM_PROXY_URL:
+        if not TELEGRAM_PROXY_URL.startswith('http'):
+            print("❌ ERROR: TELEGRAM_PROXY_URL is set but is invalid (must start with http).")
+            return False
+
+        print(f"📡 Using Proxy URL: {TELEGRAM_PROXY_URL}")
+        url = TELEGRAM_PROXY_URL
+        payload = {"message": message} 
+        
+    elif TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        print("🔗 Using Direct Telegram API access.")
+        base_url = "https://api.telegram.org/bot" 
+        url = f"{base_url}{TELEGRAM_BOT_TOKEN}/sendMessage"
+        
+        payload = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': 'HTML'
+        }
+    else:
+        print("❌ ERROR: No Telegram credentials (BOT/CHAT ID) or Proxy URL found. Logging alert locally.")
+        print(f"--- ⚠️ FALLBACK ALERT LOG: ---\n{message}\n------------------------------")
+        return False
+    
     try:
-        response = requests.post(url, data=payload)
+        # Petición HTTP usando la URL seleccionada (Proxy o Directa)
+        if TELEGRAM_PROXY_URL:
+            # El Proxy espera JSON
+            response = requests.post(url, json=payload, timeout=15)
+        else:
+            # La API de Telegram espera form-data
+            response = requests.post(url, data=payload, timeout=15)
+            
         response.raise_for_status() 
         
-        if response.json().get("ok") == False:
-            print(f"❌ Error en la API de Telegram: {response.json()}")
-        else:
-            print("✅ Telegram: Alerta enviada con éxito.")
+        print("✅ Telegram: Alert successfully sent.")
+        return True
 
-    except requests.exceptions.HTTPError as err:
-        print(f"❌ HTTP ERROR when sending to Telegram: {err}")
-        print(f"Server response: {response.text}")
-    except Exception as e:
-        print(f"Unknown error when sending Telegram alert: {e}")
-
+    except requests.exceptions.RequestException as e:
+        print(f"❌ FATAL NETWORK/API ERROR: Telegram alert FAILED. (Endpoint: {'PROXY' if TELEGRAM_PROXY_URL else 'DIRECT'})")
+        print(f"Failure Reason: {type(e).__name__} - {e}")
+        print(f"--- ⚠️ FALLBACK ALERT LOG: ---\n{message}\n------------------------------")
+        return False
         
-def main():
+        
+async def main():
     """
     Orchestrates the live scanner process: loads models, fetches data, 
     processes features, and triggers predictions/alerts.
+    
+    Returns:
+        bool: True if an alert was sent, False otherwise.
     """
     print("--- ⏳ Initializing Live Market Scanner ---")
     
     # 1. Load the "Brain"
     models = load_all_models()
     if not models:
-        return
+        return False
         
     # 2. Fetch Data Context (API Simulation)
     df_ohlcv_context = fetch_live_data_simulation()
     if df_ohlcv_context.empty:
-        return
+        return False
 
     # 3. Process the 5 Features of the last candle
     df_current_features = process_live_features(df_ohlcv_context)
     
     # 4. Predict and Alert
-    predict_and_alert(df_current_features, models)
+    alert_sent = await predict_and_alert(df_current_features, models)
     
     print("--- ✅ Scan Complete. ---")
+    
+    return alert_sent
 
 
 if __name__ == '__main__':
-    main()
+    import asyncio
+    asyncio.run(main())
