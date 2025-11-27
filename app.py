@@ -91,6 +91,23 @@ def read_root():
         "deployment": "Hugging Face Docker Space"
     }
 
+@app.post("/test_proxy_connection")
+async def test_proxy_connection_api():
+    """TEMPORARY endpoint to test Proxy -> Telegram connectivity."""
+    try:
+        from src.model_pipeline.scanner_live import send_telegram_alert 
+        
+        test_message = "🚀 [TEST LOCAL] Successful Connectivity through Render Proxy."
+        
+        await send_telegram_alert(test_message)
+        
+        return {"status": "success", "message": "✅ Test alert successfully sent to Render Proxy."}
+        
+    except Exception as e:
+        # This is what is returned in case of failure
+        return {"status": "error", "message": f"❌ Test alert sending failed: {str(e)}"}
+    
+
 @app.get("/run_scanner")
 def run_scanner_api():
     """Endpoint to manually trigger the scanner and send an alert ONLY if a strong signal (>= 70%) is found."""
