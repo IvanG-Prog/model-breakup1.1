@@ -1,8 +1,9 @@
 #  🤖 ML-Scanner V1: Algorithmic Trading Alert System
 This project implements an automated **Machine Learning (ML)** system designed to **scan cryptocurrency markets** 24 hours a day and issue **alerts** in real time directly to **Telegram**.
 
-<img src="docs/scanner-image.jpeg" alt="Logo" width="500"/>
-
+<p align="center">
+  <img src="docs/scanner-image.jpeg" alt="Logo" width="500"/>
+</p>
 ---
 
 ## ✨ Key Features
@@ -62,7 +63,7 @@ Use the /run_scanner endpoint to force an immediate market scan.
 ## ☁️ Manual Testing in the Cloud (Deployed Mode)
 This section is designed for the project owner or collaborators who have access to the Telegram channel, allowing verification of the model logic and connectivity of the deployed system.
 
-###1. Accessing Swagger
+### 1. Accessing Swagger
 
 Navigate to the documentation URL for your Hugging Face Space:
 
