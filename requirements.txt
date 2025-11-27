@@ -1,0 +1,11 @@
+pandas
+numpy
+scikit-learn
+matplotlib
+joblib
+ta-lib 
+scipy
+fastapi
+uvicorn 
+ccxt
+python-dotenv
