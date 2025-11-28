@@ -9,6 +9,7 @@ services:
     environment:
       # CRITICAL: Local setting uses the internal Docker network name 'telegram_proxy'
       TELEGRAM_PROXY_URL: "http://telegram_proxy:8001/send_alert" 
+      #TELEGRAM_PROXY_URL: "https://model-breakup1-1.onrender.com/send_alert" # Use this for remote deployment without proxy service in render, but we should comment the local proxy service in this case 
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN} 
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
     volumes:

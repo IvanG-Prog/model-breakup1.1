@@ -1,21 +1,15 @@
-"""
-This script functions as the live market scanner and inference engine. It simulates 
-fetching real-time OHLCV data, processes the features for the current candle, 
-loads the trained multi-target models, and predicts the statistical advantage. 
-It generates a clear alert if the net advantage exceeds a predefined minimum threshold.
-"""
+"""This script functions as the live market scanner and inference engine. It simulates fetching real-time OHLCV data, processes the features for the current candle, loads the trained multi-target models, and predicts the statistical advantage. It generates a clear alert if the net advantage exceeds a predefined minimum threshold."""
 import ccxt
 import pandas as pd
 import joblib
 import os
 import sys
 import requests
-import asyncio # Necesario para ejecutar main()
+import asyncio
 from scipy.stats import linregress 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone 
 import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-
 
 # --- Import Utility Functions and Constants ---
 from utils.feature_calculator import (
@@ -37,6 +31,7 @@ MODELS_DIR = os.path.join(BASE_PATH, 'models')
 
 TARGET_COLUMNS = ['Target_1x', 'Target_2x', 'Target_3x', 'Target_5x', 'Target_10x', 'Target_15x', 'Target_20x']
 MINIMUM_ADVANTAGE_ALERT = 70.0 # Minimum Net Advantage (%) to trigger an alert.
+VENEZUELA_TZ_OFFSET = timedelta(hours=-4) # UTC-4 for local time adjustment
 
 # --- Helper Functions (Borrowed from predict_probability.py) ---
 
@@ -71,8 +66,7 @@ def calculate_break_even(target_value):
     be_needed = (sl_multiplier / (sl_multiplier + target_value)) * 100 
     return round(be_needed, 2)
 
-
-# --- Live Data and Feature Processing Functions ---
+# --- Live Data and Feature Processing Functions (Unchanged) ---
 
 def fetch_live_data_simulation():
     """
@@ -95,7 +89,7 @@ def fetch_live_data_simulation():
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         
         if not ohlcv:
-            print(f"❌ Error: ccxt no devolvió datos OHLCV de {exchange_name}.")
+            print(f"❌ Error: ccxt did not return OHLCV data from {exchange_name}.")
             return pd.DataFrame()
         
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -163,6 +157,60 @@ def process_live_features(df_ohlcv_context):
     # Return a one-row DataFrame for prediction
     return last_features[feature_cols].to_frame().T.dropna()
 
+# --- Refactored Telegram Alert Functions ---
+
+def _send_telegram_alert_internal(message: str):
+    """
+    Internal function to send a message via Proxy or Direct Telegram API.
+    """
+    if TELEGRAM_PROXY_URL:
+        if not TELEGRAM_PROXY_URL.startswith('http'):
+            print("❌ ERROR: TELEGRAM_PROXY_URL is set but is invalid (must start with http).")
+            return False
+        print(f"📡 Using Proxy URL: {TELEGRAM_PROXY_URL}")
+        url = TELEGRAM_PROXY_URL
+        payload = {"message": message} 
+            
+    elif TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        print("🔗 Using Direct Telegram API access.")
+        base_url = "https://api.telegram.org/bot" 
+        url = f"{base_url}{TELEGRAM_BOT_TOKEN}/sendMessage"
+        
+        payload = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': 'HTML'
+        }
+    else:
+        print("❌ ERROR: No Telegram credentials (BOT/CHAT ID) or Proxy URL found. Logging alert locally.")
+        return False
+        
+    try:
+        # HTTP Request using the selected URL (Proxy or Direct)
+        if TELEGRAM_PROXY_URL:
+            # Proxy expects JSON
+            response = requests.post(url, json=payload, timeout=15)
+        else:
+            # Telegram API expects form-data
+            response = requests.post(url, data=payload, timeout=15)
+                    
+        response.raise_for_status() 
+                
+        print("✅ Telegram: Alert successfully sent.")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"❌ FATAL NETWORK/API ERROR: Telegram alert FAILED. (Endpoint: {'PROXY' if TELEGRAM_PROXY_URL else 'DIRECT'})")
+        print(f"Failure Reason: {type(e).__name__} - {e}")
+        return False
+
+# Public wrapper for simple status/wake-up messages
+def send_ping_message(message: str):
+    """
+    Public function to send a non-critical ping message. Used by the scheduler.
+    """
+    return _send_telegram_alert_internal(message)
+
+# --- Prediction and Alert Logic (Updated to use internal alert function) ---
 
 async def predict_and_alert(df_current_features, models):
     """
@@ -176,7 +224,9 @@ async def predict_and_alert(df_current_features, models):
         print("❌ Insufficient data or feature calculation failed for the current candle.")
         return False
 
-    timestamp = df_current_features.index[0]
+    timestamp_utc = df_current_features.index[0].tz_localize(timezone.utc) # Ensure it's timezone aware
+    timestamp_local = timestamp_utc + VENEZUELA_TZ_OFFSET # Convert to local time for display
+    
     features = df_current_features.iloc[0]
     
     # Check if 'ATR_14' exists before accessing it
@@ -186,7 +236,7 @@ async def predict_and_alert(df_current_features, models):
         
     atr_value = features['ATR_14']
     
-    print(f"\n--- 🧠 LIVE PREDICTION DIAGNOSTICS: {timestamp} ---")
+    print(f"\n--- 🧠 LIVE PREDICTION DIAGNOSTICS: {timestamp_local} (Local) ---")
     
     rsi_value = features['RSI_14']
     
@@ -220,7 +270,6 @@ async def predict_and_alert(df_current_features, models):
             best_prob = prob_percent
 
     # 2. Generate Alert (if threshold is met)
-    
     if max_advantage >= MINIMUM_ADVANTAGE_ALERT:
         
         # Calculate R:R for the best target for the alert message
@@ -231,7 +280,7 @@ async def predict_and_alert(df_current_features, models):
         message = f"""
         🚨 ML SIGNAL ALERT! 🚨
         ------------------------------------------
-        ⌚ Time: {timestamp.strftime('%Y-%m-%d %H:%M')}
+        ⌚ Time (Local): {timestamp_local.strftime('%Y-%m-%d %H:%M')}
         🚀 Direction: {direction}
         🎯 Best Target: {best_target} (R:R {r_r_ratio:.1f}:1)
         📊 P. Prediction: {best_prob:.2f}%
@@ -241,8 +290,8 @@ async def predict_and_alert(df_current_features, models):
         """
         print(message)
 
-        # CORRECTED: Call the synchronous alert function
-        send_telegram_alert(message)
+        # Use internal function
+        _send_telegram_alert_internal(message)
         return True # <-- Signal found and sent
 
     else:
@@ -250,56 +299,6 @@ async def predict_and_alert(df_current_features, models):
         return False # <-- Signal rejected
 
 
-def send_telegram_alert(message: str):
-    """
-    Sends a message, prioritizing the Proxy URL if defined, otherwise defaulting to direct Telegram API access.
-    """
-    
-    if TELEGRAM_PROXY_URL:
-        if not TELEGRAM_PROXY_URL.startswith('http'):
-            print("❌ ERROR: TELEGRAM_PROXY_URL is set but is invalid (must start with http).")
-            return False
-
-        print(f"📡 Using Proxy URL: {TELEGRAM_PROXY_URL}")
-        url = TELEGRAM_PROXY_URL
-        payload = {"message": message} 
-        
-    elif TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        print("🔗 Using Direct Telegram API access.")
-        base_url = "https://api.telegram.org/bot" 
-        url = f"{base_url}{TELEGRAM_BOT_TOKEN}/sendMessage"
-        
-        payload = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'HTML'
-        }
-    else:
-        print("❌ ERROR: No Telegram credentials (BOT/CHAT ID) or Proxy URL found. Logging alert locally.")
-        print(f"--- ⚠️ FALLBACK ALERT LOG: ---\n{message}\n------------------------------")
-        return False
-    
-    try:
-        # Petición HTTP usando la URL seleccionada (Proxy o Directa)
-        if TELEGRAM_PROXY_URL:
-            # El Proxy espera JSON
-            response = requests.post(url, json=payload, timeout=15)
-        else:
-            # La API de Telegram espera form-data
-            response = requests.post(url, data=payload, timeout=15)
-            
-        response.raise_for_status() 
-        
-        print("✅ Telegram: Alert successfully sent.")
-        return True
-
-    except requests.exceptions.RequestException as e:
-        print(f"❌ FATAL NETWORK/API ERROR: Telegram alert FAILED. (Endpoint: {'PROXY' if TELEGRAM_PROXY_URL else 'DIRECT'})")
-        print(f"Failure Reason: {type(e).__name__} - {e}")
-        print(f"--- ⚠️ FALLBACK ALERT LOG: ---\n{message}\n------------------------------")
-        return False
-        
-        
 async def main():
     """
     Orchestrates the live scanner process: loads models, fetches data, 
@@ -326,10 +325,31 @@ async def main():
     # 4. Predict and Alert
     alert_sent = await predict_and_alert(df_current_features, models)
     
+    # --- HEARTBEAT LOGIC (ONLY if no signal was sent) ---
+    if not alert_sent:
+        
+        # Get current time in UTC, then convert to local time (UTC-4)
+        current_time_utc = datetime.now(timezone.utc)
+        current_time_local = current_time_utc + VENEZUELA_TZ_OFFSET
+
+        # Check if the local time is within the 8 AM (8) to 10 PM (22) window
+        is_daytime_window = 8 <= current_time_local.hour < 22
+        
+        if is_daytime_window:
+            heartbeat_message = (
+                f"🟢 **Scanner Status: OK** (Local Time)\n"
+                f"No high-probability signal (>70.0%) found at {current_time_local.strftime('%Y-%m-%d %H:%M:%S')} VET."
+            )
+            # Use internal function
+            _send_telegram_alert_internal(heartbeat_message)
+        else:
+            print("🤫 Silent mode active: No signal found and outside 8 AM - 10 PM window.")
+    
+    # --------------------------------------------------
+    
     print("--- ✅ Scan Complete. ---")
     
     return alert_sent
-
 
 if __name__ == '__main__':
     import asyncio
