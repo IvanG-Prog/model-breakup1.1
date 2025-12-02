@@ -25,7 +25,7 @@ async def proxy_telegram_alert(payload: AlertPayload):
     tg_payload = {
         'chat_id': TELEGRAM_CHAT_ID,
         'text': payload.message,
-        'parse_mode': 'Markdown' # Changed to Markdown to match the main app's replies
+        'parse_mode': 'HTML'
     }
     
     try:
@@ -41,8 +41,9 @@ async def proxy_telegram_alert(payload: AlertPayload):
         print(f"❌ Proxy ERROR: {error_detail}")
         return {"status": "error", "detail": error_detail}
 
+# --- NUEVO ENDPOINT PARA KEEP-ALIVE ---
 @app.get("/keep_alive")
 async def keep_alive():
-    """Endpoint for the scheduler to ping the proxy and prevent it from sleeping."""
-    print("🟢 Proxy: Received keep-alive ping.")
-    return {"status": "success", "detail": "Proxy is awake and responsive."}
+    """Endpoint de ping para evitar que el proxy entre en modo de suspensión."""
+    print("🟢 Proxy: Ping keep-alive recibido.")
+    return {"status": "success", "detail": "Proxy está activo y responde."}
