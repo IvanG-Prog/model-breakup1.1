@@ -3,8 +3,8 @@ import pandas as pd
 import joblib
 import os
 import sys
-import requests
 import asyncio
+import httpx #
 from scipy.stats import linregress 
 from datetime import datetime, timedelta, timezone 
 import numpy as np
@@ -26,6 +26,8 @@ from utils.feature_calculator import (
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN') 
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 TELEGRAM_PROXY_URL = os.environ.get('TELEGRAM_PROXY_URL') 
+PROXY_WAKEUP_TIMEOUT = 45 # Increased timeout to give Render time to wake up
+PROXY_KEEP_ALIVE_TIMEOUT = 10 # Shorter timeout for simple ping
 
 BASE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 MODELS_DIR = os.path.join(BASE_PATH, 'models') 
@@ -55,7 +57,6 @@ def load_all_models():
     for target in TARGET_COLUMNS:
         model_path = os.path.join(MODELS_DIR, f'random_forest_multi_target_{target}.pkl')
         try:
-            # Note: We need to use 'rb' mode for joblib load
             models[target] = joblib.load(model_path)
         except FileNotFoundError:
             print(f"⚠️ ERROR: Model not found at {model_path}. Ensure tune_model.py has been executed.")
@@ -110,7 +111,7 @@ def fetch_and_process_features(symbol: str, timeframe: str = '1h', limit: int = 
         print(f"❌ Error connecting or obtaining data from {exchange_name} for {symbol}: {e}")
         return pd.DataFrame()
 
-    # Feature Calculation Logic (copied from original process_live_features)
+    # Feature Calculation Logic
     if len(df_ohlcv_context) < SLOPE_WINDOW:
         print(f"❌ Insufficient historical data ({len(df_ohlcv_context)} candles) to calculate Slope 50 for {symbol}.")
         return pd.DataFrame()
@@ -173,16 +174,21 @@ RSI: {features['RSI_14']:.2f} | Slope 50: {features['Slope_50']:.2f} | ATR 14: {
     return message
 
 
-# --- Telegram Alert Functions ---
-# (Using the same functions from the previous implementation)
-def _send_telegram_alert_internal(message: str) -> bool:
-    """Internal function to send a message via Proxy or Direct Telegram API."""
-    # Logic remains the same: attempts to send via proxy or direct API
+# --- Telegram Alert Functions (UPDATED TO ASYNC HTTPX) ---
+
+async def _send_telegram_alert_internal(message: str) -> bool:
+    """
+    [ASYNC VERSION] Internal function to send a message via Proxy 
+    or Direct Telegram API, using httpx and a longer timeout for Render wakeup.
+    """
+    
     if TELEGRAM_PROXY_URL:
-        # ... (Proxy logic) ...
+        # 1. Logic for PROXY
         url = TELEGRAM_PROXY_URL
+        # Proxy expects 'message' key
         payload = {"message": message} 
     elif TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        # 2. Logic for Direct Telegram API (Fallback/Test)
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
     else:
@@ -190,21 +196,62 @@ def _send_telegram_alert_internal(message: str) -> bool:
         return False
         
     try:
-        if TELEGRAM_PROXY_URL:
-            response = requests.post(url, json=payload, timeout=15)
-        else:
-            response = requests.post(url, data=payload, timeout=15)
-                    
+        async with httpx.AsyncClient() as client:
+            
+            # Use the defined timeout (e.g., 45 seconds)
+            response = await client.post(url, json=payload, timeout=PROXY_WAKEUP_TIMEOUT)
+            
             response.raise_for_status() 
             print("✅ Telegram: Alert successfully sent.")
             return True
-    except requests.exceptions.RequestException as e:
-        print(f"❌ FATAL NETWORK/API ERROR: Telegram alert FAILED. {e}")
+            
+    except httpx.ReadTimeout:
+        print(f"❌ FATAL NETWORK/API ERROR: Telegram alert FAILED. Read timed out after {PROXY_WAKEUP_TIMEOUT}s (Render was asleep).")
+        return False
+    except httpx.HTTPStatusError as e:
+        print(f"❌ FATAL NETWORK/API ERROR: Telegram alert FAILED. HTTP Error {e.response.status_code}. Response: {e.response.text}")
+        return False
+    except Exception as e:
+        print(f"❌ FATAL NETWORK/API ERROR: Telegram alert FAILED. {type(e).__name__}: {e}")
         return False
 
-def send_ping_message(message: str) -> bool:
-    """Public function to send a non-critical ping message. Used by the scheduler."""
-    return _send_telegram_alert_internal(message)
+
+async def send_ping_message(message: str) -> bool:
+    """Public function to send a non-critical ping message."""
+    # This now calls the new async internal sender
+    return await _send_telegram_alert_internal(message)
+
+async def send_proxy_keep_alive() -> bool:
+    """
+    Sends a lightweight GET request to the Proxy Service's /keep_alive endpoint
+    to prevent the Proxy service from entering sleep mode on Render.
+    """
+    if not TELEGRAM_PROXY_URL:
+        return False
+        
+    base_url_parts = TELEGRAM_PROXY_URL.split('/send_alert')
+    base_url = base_url_parts[0] if base_url_parts[0] else TELEGRAM_PROXY_URL 
+
+    # Construct the full URL for the new GET endpoint
+    url = f"{base_url}/keep_alive"
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            # Use a short timeout (10s) as this should be a fast request to an already running server
+            response = await client.get(url, timeout=PROXY_KEEP_ALIVE_TIMEOUT)
+            response.raise_for_status() 
+            print("🟢 Proxy Keep-Alive: Ping sent successfully.")
+            return True
+            
+    except httpx.HTTPStatusError as e:
+        # This means the endpoint /keep_alive is missing or the proxy is misconfigured/down.
+        print(f"❌ Proxy Keep-Alive ERROR: HTTP Error {e.response.status_code}. Please ensure /keep_alive endpoint exists in proxy_main.py.")
+        return False
+    except Exception as e:
+        # This catches connection errors, including the proxy being asleep and taking too long (timeout)
+        print(f"❌ Proxy Keep-Alive ERROR: Failed to ping proxy: {type(e).__name__} - {e}")
+        return False
+
 
 # --- Core ML Prediction Logic ---
 
@@ -252,7 +299,7 @@ def _get_prediction_metrics(df_current_features, models):
         'rsi_value': rsi_value
     }
 
-# --- New Interactive Prediction Function (NOW SYNCHRONOUS) ---
+# --- New Interactive Prediction Function (NOW SYNCHRONOUS - Must be run in thread) ---
 def run_single_symbol_prediction(symbol: str) -> dict | None:
     """
     Executes the full prediction for a single symbol and returns the result dictionary.
@@ -293,12 +340,12 @@ def run_single_symbol_prediction(symbol: str) -> dict | None:
     
     return result
 
-# --- Main Scan and Alert Logic (Updated to use modular functions) ---
+# --- Main Scan and Alert Logic (Updated to use modular functions and now ASYNC) ---
 
 async def predict_and_alert(df_current_features, models, symbol: str, source: str = 'SCHEDULED'):
     """
     Predicts the probability and sends an alert if the minimum advantage is met.
-    (This function is used by the continuous scheduler).
+    (This function is used by the continuous scheduler and is now ASYNC).
     """
     
     if df_current_features.empty:
@@ -319,19 +366,22 @@ async def predict_and_alert(df_current_features, models, symbol: str, source: st
         # Use formatting function for alert message
         alert_message = format_prediction_result(df_current_features.iloc[0], prediction_metrics, timestamp_local, symbol, source)
 
-        print(f"--- ✅ ALERTA ENVIADA: Net Advantage {max_advantage:.2f}% ---")
-        _send_telegram_alert_internal(alert_message)
-        return True # <-- Signal found and sent
-
+        print(f"--- ✅ ALERT SENT: Net Advantage {max_advantage:.2f}% ---")
+        
+        # Call the new ASYNC sender
+        alert_success = await _send_telegram_alert_internal(alert_message)
+        
+        return alert_success # <-- Return success of the alert send
+    
     else:
         # Signal rejected - logs internally but remains SILENT on Telegram
         print(f"🟡 Prediction found ({prediction_metrics['best_target']}), but Net Advantage ({max_advantage:.2f}%) is below the alert threshold ({MINIMUM_ADVANTAGE_ALERT:.2f}%).")
         return False # <-- Signal rejected
 
+# Main Orchestration function (now ASYNC to allow awaiting IO operations)
 async def run_scanner_main(source: str = 'SCHEDULED'):
     """
-    Orchestrates the live scanner process (used by the scheduler).
-    Currently runs for ETH/USDT only.
+    Orchestrates the live scanner process (used by the scheduler and webhooks).
     """
     print("--- ⏳ Initializing Live Market Scanner ---")
     
@@ -341,8 +391,10 @@ async def run_scanner_main(source: str = 'SCHEDULED'):
         
     symbol_to_scan = 'ETH/USDT'
     
-    df_current_features = fetch_and_process_features(symbol_to_scan, limit=100)
+    # Run CPU/IO bound tasks in a separate thread to prevent blocking the event loop
+    df_current_features = await asyncio.to_thread(fetch_and_process_features, symbol_to_scan, '1h', 100)
     
+    # Run async network task (alerting) in the event loop
     alert_sent = await predict_and_alert(df_current_features, models, symbol_to_scan, source)
     
     print("--- ✅ Scan Complete. ---")

@@ -10,10 +10,10 @@ load_dotenv()
 # Set up import paths for modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__))))
 
-# Import scheduler functions (from src/scheduler/background_scheduler.py)
+# Import scheduler functions (using the corrected names: start_scanner and stop_scanner)
 from src.scheduler.background_scheduler import (
-    start_scheduler, 
-    stop_scheduler, 
+    start_scanner, 
+    stop_scanner, 
     SCAN_INTERVAL_SECONDS
 )
 
@@ -24,13 +24,13 @@ from src.api.routes import router as api_router
 async def lifespan(app: FastAPI):
     """FastAPI lifecycle function to start the scheduler thread on startup and stop it on shutdown."""
     
-    # 1. Start the Scheduler in a separate thread
-    start_scheduler()
+    # 1. Start the Scanner/Scheduler
+    start_scanner(app)
     
     yield
     
-    # 2. Stop the Scheduler when the server shuts down
-    stop_scheduler()
+    # 2. Stop the Scanner/Scheduler when the server shuts down
+    stop_scanner()
 
 
 app = FastAPI(
