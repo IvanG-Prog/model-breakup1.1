@@ -25,7 +25,7 @@ async def proxy_telegram_alert(payload: AlertPayload):
     tg_payload = {
         'chat_id': TELEGRAM_CHAT_ID,
         'text': payload.message,
-        'parse_mode': 'HTML'
+        'parse_mode': 'Markdown' # Changed to Markdown to match the main app's replies
     }
     
     try:
@@ -40,3 +40,9 @@ async def proxy_telegram_alert(payload: AlertPayload):
         error_detail = f"Failed to send to Telegram from Proxy: {type(e).__name__} - {e}"
         print(f"❌ Proxy ERROR: {error_detail}")
         return {"status": "error", "detail": error_detail}
+
+@app.get("/keep_alive")
+async def keep_alive():
+    """Endpoint for the scheduler to ping the proxy and prevent it from sleeping."""
+    print("🟢 Proxy: Received keep-alive ping.")
+    return {"status": "success", "detail": "Proxy is awake and responsive."}

@@ -1,14 +1,16 @@
-"""This script functions as the live market scanner and inference engine. It simulates fetching real-time OHLCV data, processes the features for the current candle, loads the trained multi-target models, and predicts the statistical advantage. It generates a clear alert if the net advantage exceeds a predefined minimum threshold."""
 import ccxt
 import pandas as pd
 import joblib
 import os
 import sys
-import requests
 import asyncio
+import httpx #
 from scipy.stats import linregress 
 from datetime import datetime, timedelta, timezone 
 import numpy as np
+import json 
+
+# Ensure correct path configuration
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 # --- Import Utility Functions and Constants ---
@@ -20,12 +22,13 @@ from utils.feature_calculator import (
     SLOPE_WINDOW
 )
 
-# --- Telegram Configuration ---
+# --- Configuration and Constants ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN') 
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 TELEGRAM_PROXY_URL = os.environ.get('TELEGRAM_PROXY_URL') 
+PROXY_WAKEUP_TIMEOUT = 45 # Increased timeout to give Render time to wake up
+PROXY_KEEP_ALIVE_TIMEOUT = 10 # Shorter timeout for simple ping
 
-# --- Global Configuration ---
 BASE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 MODELS_DIR = os.path.join(BASE_PATH, 'models') 
 
@@ -33,7 +36,10 @@ TARGET_COLUMNS = ['Target_1x', 'Target_2x', 'Target_3x', 'Target_5x', 'Target_10
 MINIMUM_ADVANTAGE_ALERT = 70.0 # Minimum Net Advantage (%) to trigger an alert.
 VENEZUELA_TZ_OFFSET = timedelta(hours=-4) # UTC-4 for local time adjustment
 
-# --- Helper Functions (Borrowed from predict_probability.py) ---
+# --- Helper Functions (Loaded Models and Break Even) ---
+
+# Global variable for models (loaded once at the beginning of the process)
+LOADED_MODELS = None
 
 def load_all_models():
     """
@@ -42,6 +48,10 @@ def load_all_models():
     Returns:
         dict: A dictionary mapping target names to their loaded model objects.
     """
+    global LOADED_MODELS
+    if LOADED_MODELS is not None:
+        return LOADED_MODELS
+        
     models = {}
     print("Loading all 7 multi-target models...")
     for target in TARGET_COLUMNS:
@@ -51,6 +61,7 @@ def load_all_models():
         except FileNotFoundError:
             print(f"⚠️ ERROR: Model not found at {model_path}. Ensure tune_model.py has been executed.")
             return None
+    LOADED_MODELS = models
     return models
 
 def calculate_break_even(target_value):
@@ -66,67 +77,49 @@ def calculate_break_even(target_value):
     be_needed = (sl_multiplier / (sl_multiplier + target_value)) * 100 
     return round(be_needed, 2)
 
-# --- Live Data and Feature Processing Functions (Unchanged) ---
+# --- Feature Processing and Data Fetching (Modularized) ---
 
-def fetch_live_data_simulation():
+def fetch_and_process_features(symbol: str, timeframe: str = '1h', limit: int = 100):
     """
-    Fetches the last 100 OHLCV candles from the KuCoin exchange using ccxt.
+    Fetches OHLCV data for a single symbol and calculates the 5 required features.
     
     Returns:
-        pd.DataFrame: DataFrame containing OHLCV data.
+        pd.DataFrame: A one-row DataFrame containing the 5 features, or empty DataFrame.
     """
     exchange_name = 'kucoin' 
-    symbol = 'ETH/USDT'
-    timeframe = '1h'
-    limit = 100
 
-    print(f"📡 Fetching live data from {exchange_name}...")
+    print(f"📡 Fetching data for {symbol} from {exchange_name}...")
     
     try:
         exchange_class = getattr(ccxt, exchange_name)
         exchange = exchange_class({'enableRateLimit': True})
         
+        # ccxt is blocking I/O, which is fine as this function will be run in a separate thread.
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         
         if not ohlcv:
-            print(f"❌ Error: ccxt did not return OHLCV data from {exchange_name}.")
+            print(f"❌ Error: ccxt did not return OHLCV data for {symbol}.")
             return pd.DataFrame()
         
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df = df.set_index('timestamp')
-        
         df = df[~df.index.duplicated(keep='first')] 
-        
-        return df.tail(limit)
+        df_ohlcv_context = df.tail(limit)
 
     except Exception as e:
-        print(f"❌ Error connecting or obtaining data from  {exchange_name}: {e}")
+        print(f"❌ Error connecting or obtaining data from {exchange_name} for {symbol}: {e}")
         return pd.DataFrame()
 
-
-def process_live_features(df_ohlcv_context):
-    """
-    Calculates the 5 required features for the last candle in the OHLCV context.
-    
-    Returns:
-        pd.DataFrame: A one-row DataFrame containing the 5 features.
-    """
-    
-    # Ensure the context has enough data
+    # Feature Calculation Logic
     if len(df_ohlcv_context) < SLOPE_WINDOW:
-        print(f"❌ Insufficient historical data ({len(df_ohlcv_context)} candles) to calculate Slope 50.")
+        print(f"❌ Insufficient historical data ({len(df_ohlcv_context)} candles) to calculate Slope 50 for {symbol}.")
         return pd.DataFrame()
 
     df = df_ohlcv_context.copy()
-    
-    # 1. BB_Position 
     df = calculate_bb_position(df)
-    
-    # 2. ATR and RSI
     df = calculate_base_features(df, atr_period=ATR_PERIOD)
     
-    # 3. Slope 50 
     def apply_slope(series):
         if len(series) < SLOPE_WINDOW:
             return np.nan
@@ -135,9 +128,6 @@ def process_live_features(df_ohlcv_context):
         return slope
         
     df['Slope_50'] = df['close'].rolling(window=SLOPE_WINDOW).apply(apply_slope, raw=False)
-
-
-    # 4. Rejection Power (Calculated only on the latest candle)
     last_candle = df_ohlcv_context.iloc[-1]
     rejection_power = calculate_rejection_power(
         open_price=last_candle['open'],
@@ -145,118 +135,150 @@ def process_live_features(df_ohlcv_context):
         high_price=last_candle['high'],
         low_price=last_candle['low']
     )
-    
-    # Select the features from the last row (the most recent one)
     last_features = df.iloc[-1].copy() 
-    
-    # Overwrite Rejection Power
     last_features['Rejection_Power'] = rejection_power
     
     feature_cols = ['ATR_14', 'RSI_14', 'Slope_50', 'Rejection_Power', 'BB_Position']
     
-    # Return a one-row DataFrame for prediction
     return last_features[feature_cols].to_frame().T.dropna()
 
-# --- Refactored Telegram Alert Functions ---
-
-def _send_telegram_alert_internal(message: str):
-    """
-    Internal function to send a message via Proxy or Direct Telegram API.
-    """
-    if TELEGRAM_PROXY_URL:
-        if not TELEGRAM_PROXY_URL.startswith('http'):
-            print("❌ ERROR: TELEGRAM_PROXY_URL is set but is invalid (must start with http).")
-            return False
-        print(f"📡 Using Proxy URL: {TELEGRAM_PROXY_URL}")
-        url = TELEGRAM_PROXY_URL
-        payload = {"message": message} 
-            
-    elif TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        print("🔗 Using Direct Telegram API access.")
-        base_url = "https://api.telegram.org/bot" 
-        url = f"{base_url}{TELEGRAM_BOT_TOKEN}/sendMessage"
-        
-        payload = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'HTML'
-        }
+def format_prediction_result(features, prediction_metrics, timestamp_local, symbol: str, source: str = 'SCHEDULED') -> str:
+    """Formats the prediction result into a Telegram message string."""
+    
+    # Calculate R:R for the best target for the alert message
+    target_val = int(prediction_metrics['best_target'].split('_')[1].replace('x', ''))
+    sl_mult = 1.0 if target_val <= 5 else 3.0
+    r_r_ratio = target_val / sl_mult
+    
+    # Determine header and source tag
+    if source in ['MANUAL_API', 'TELEGRAM_WEBHOOK', 'SINGLE_SYMBOL']:
+        header_emoji = "🕵️"
+        source_tag = "(Manual Scan)"
     else:
-        print("❌ ERROR: No Telegram credentials (BOT/CHAT ID) or Proxy URL found. Logging alert locally.")
+        header_emoji = "🔥"
+        source_tag = "(Scheduled Scan)"
+
+    # Build the message
+    message = f"""
+{header_emoji} ML SIGNAL ALERT! {source_tag} {header_emoji}
+------------------------------------------
+⌚ Time (Local): {timestamp_local.strftime('%Y-%m-%d %H:%M')}
+📈 Symbol: {symbol}
+🚀 Direction: {prediction_metrics['direction']}
+🎯 Best Target: {prediction_metrics['best_target']} (R:R {r_r_ratio:.1f}:1)
+📊 P. Prediction: {prediction_metrics['best_prob']:.2f}%
+🟢 Net Advantage: +{prediction_metrics['max_advantage']:.2f}%
+------------------------------------------
+RSI: {features['RSI_14']:.2f} | Slope 50: {features['Slope_50']:.2f} | ATR 14: {features['ATR_14']:.2f}
+"""
+    return message
+
+
+# --- Telegram Alert Functions (UPDATED TO ASYNC HTTPX) ---
+
+async def _send_telegram_alert_internal(message: str) -> bool:
+    """
+    [ASYNC VERSION] Internal function to send a message via Proxy 
+    or Direct Telegram API, using httpx and a longer timeout for Render wakeup.
+    """
+    
+    if TELEGRAM_PROXY_URL:
+        # 1. Logic for PROXY
+        url = TELEGRAM_PROXY_URL
+        # Proxy expects 'message' key
+        payload = {"message": message} 
+    elif TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        # 2. Logic for Direct Telegram API (Fallback/Test)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
+    else:
+        print("❌ ERROR: No Telegram credentials/Proxy URL found.")
         return False
         
     try:
-        # HTTP Request using the selected URL (Proxy or Direct)
-        if TELEGRAM_PROXY_URL:
-            # Proxy expects JSON
-            response = requests.post(url, json=payload, timeout=15)
-        else:
-            # Telegram API expects form-data
-            response = requests.post(url, data=payload, timeout=15)
-                    
-        response.raise_for_status() 
-                
-        print("✅ Telegram: Alert successfully sent.")
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"❌ FATAL NETWORK/API ERROR: Telegram alert FAILED. (Endpoint: {'PROXY' if TELEGRAM_PROXY_URL else 'DIRECT'})")
-        print(f"Failure Reason: {type(e).__name__} - {e}")
+        async with httpx.AsyncClient() as client:
+            
+            # Use the defined timeout (e.g., 45 seconds)
+            response = await client.post(url, json=payload, timeout=PROXY_WAKEUP_TIMEOUT)
+            
+            response.raise_for_status() 
+            print("✅ Telegram: Alert successfully sent.")
+            return True
+            
+    except httpx.ReadTimeout:
+        print(f"❌ FATAL NETWORK/API ERROR: Telegram alert FAILED. Read timed out after {PROXY_WAKEUP_TIMEOUT}s (Render was asleep).")
+        return False
+    except httpx.HTTPStatusError as e:
+        print(f"❌ FATAL NETWORK/API ERROR: Telegram alert FAILED. HTTP Error {e.response.status_code}. Response: {e.response.text}")
+        return False
+    except Exception as e:
+        print(f"❌ FATAL NETWORK/API ERROR: Telegram alert FAILED. {type(e).__name__}: {e}")
         return False
 
-# Public wrapper for simple status/wake-up messages
-def send_ping_message(message: str):
-    """
-    Public function to send a non-critical ping message. Used by the scheduler.
-    """
-    return _send_telegram_alert_internal(message)
 
-# --- Prediction and Alert Logic (Updated to use internal alert function) ---
+async def send_ping_message(message: str) -> bool:
+    """Public function to send a non-critical ping message."""
+    # This now calls the new async internal sender
+    return await _send_telegram_alert_internal(message)
 
-async def predict_and_alert(df_current_features, models):
+async def send_proxy_keep_alive() -> bool:
     """
-    Predicts the probability for all targets and generates a clear alert 
-    message if the maximum Net Advantage exceeds the predefined minimum.
-    
-    Returns:
-        bool: True if an alert was sent, False otherwise.
+    Sends a lightweight GET request to the Proxy Service's /keep_alive endpoint
+    to prevent the Proxy service from entering sleep mode on Render.
     """
-    if df_current_features.empty:
-        print("❌ Insufficient data or feature calculation failed for the current candle.")
-        return False
-
-    timestamp_utc = df_current_features.index[0].tz_localize(timezone.utc) # Ensure it's timezone aware
-    timestamp_local = timestamp_utc + VENEZUELA_TZ_OFFSET # Convert to local time for display
-    
-    features = df_current_features.iloc[0]
-    
-    # Check if 'ATR_14' exists before accessing it
-    if 'ATR_14' not in features:
-        print("❌ ATR_14 feature missing from current features.")
+    if not TELEGRAM_PROXY_URL:
         return False
         
-    atr_value = features['ATR_14']
+    base_url_parts = TELEGRAM_PROXY_URL.split('/send_alert')
+    base_url = base_url_parts[0] if base_url_parts[0] else TELEGRAM_PROXY_URL 
+
+    # Construct the full URL for the new GET endpoint
+    url = f"{base_url}/keep_alive"
     
-    print(f"\n--- 🧠 LIVE PREDICTION DIAGNOSTICS: {timestamp_local} (Local) ---")
-    
+    try:
+        async with httpx.AsyncClient() as client:
+            # Use a short timeout (10s) as this should be a fast request to an already running server
+            response = await client.get(url, timeout=PROXY_KEEP_ALIVE_TIMEOUT)
+            response.raise_for_status() 
+            print("🟢 Proxy Keep-Alive: Ping sent successfully.")
+            return True
+            
+    except httpx.HTTPStatusError as e:
+        # This means the endpoint /keep_alive is missing or the proxy is misconfigured/down.
+        print(f"❌ Proxy Keep-Alive ERROR: HTTP Error {e.response.status_code}. Please ensure /keep_alive endpoint exists in proxy_main.py.")
+        return False
+    except Exception as e:
+        # This catches connection errors, including the proxy being asleep and taking too long (timeout)
+        print(f"❌ Proxy Keep-Alive ERROR: Failed to ping proxy: {type(e).__name__} - {e}")
+        return False
+
+
+# --- Core ML Prediction Logic ---
+
+def _get_prediction_metrics(df_current_features, models):
+    """Calculates all 7 prediction probabilities and returns the best metrics."""
+    if df_current_features.empty:
+        return None
+
+    features = df_current_features.iloc[0]
     rsi_value = features['RSI_14']
     
-    # Heuristic for Direction based on RSI
+    # Heuristic for Direction
     if rsi_value < 40:
         direction = 'LONG'
     elif rsi_value > 60:
         direction = 'SHORT'
     else:
-        print(f"🟡 Neutral State: RSI ({rsi_value:.2f}). No strong entry predicted.")
-        return False
+        direction = 'NEUTRAL'
     
     max_advantage = -np.inf
     best_target = None
     best_prob = 0.0
 
-    # 1. Execute Predictions and find the best Net Advantage
     for target, model in models.items():
         data_point = df_current_features.copy()
 
+        # Prediction is a blocking operation, which is fine as this will be run in a thread
         prob = model.predict_proba(data_point)[:, 1][0]
         prob_percent = round(prob * 100, 2)
         
@@ -268,89 +290,113 @@ async def predict_and_alert(df_current_features, models):
             max_advantage = advantage
             best_target = target
             best_prob = prob_percent
+            
+    return {
+        'direction': direction,
+        'max_advantage': max_advantage,
+        'best_target': best_target,
+        'best_prob': best_prob,
+        'rsi_value': rsi_value
+    }
+
+# --- New Interactive Prediction Function (NOW SYNCHRONOUS - Must be run in thread) ---
+def run_single_symbol_prediction(symbol: str) -> dict | None:
+    """
+    Executes the full prediction for a single symbol and returns the result dictionary.
+    
+    This is a synchronous (blocking) function designed to be executed in a separate thread.
+    
+    Returns:
+        dict | None: Dictionary with prediction details if successful, otherwise None.
+    """
+    
+    print(f"--- 🧠 Running single symbol prediction for {symbol} ---")
+    
+    models = load_all_models()
+    if not models:
+        return None
+        
+    # Fetching data and processing features are blocking I/O/CPU operations
+    df_current_features = fetch_and_process_features(symbol, limit=100)
+    if df_current_features.empty:
+        return None
+        
+    # Getting prediction metrics is a CPU-bound operation
+    prediction_metrics = _get_prediction_metrics(df_current_features, models)
+    if not prediction_metrics:
+        return None
+        
+    # Add features and timestamp to the result for formatting
+    timestamp_utc = df_current_features.index[0].tz_localize(timezone.utc)
+    timestamp_local = timestamp_utc + VENEZUELA_TZ_OFFSET
+    
+    result = {
+        'symbol': symbol,
+        'timestamp_local': timestamp_local.strftime('%Y-%m-%d %H:%M:%S'),
+        'features': df_current_features.iloc[0].to_dict(),
+        'metrics': prediction_metrics,
+        'alert_found': prediction_metrics['max_advantage'] >= MINIMUM_ADVANTAGE_ALERT
+    }
+    
+    return result
+
+# --- Main Scan and Alert Logic (Updated to use modular functions and now ASYNC) ---
+
+async def predict_and_alert(df_current_features, models, symbol: str, source: str = 'SCHEDULED'):
+    """
+    Predicts the probability and sends an alert if the minimum advantage is met.
+    (This function is used by the continuous scheduler and is now ASYNC).
+    """
+    
+    if df_current_features.empty:
+        return False
+        
+    prediction_metrics = _get_prediction_metrics(df_current_features, models)
+    if not prediction_metrics or prediction_metrics['direction'] == 'NEUTRAL':
+        return False
+        
+    max_advantage = prediction_metrics['max_advantage']
 
     # 2. Generate Alert (if threshold is met)
     if max_advantage >= MINIMUM_ADVANTAGE_ALERT:
         
-        # Calculate R:R for the best target for the alert message
-        target_val = int(best_target.split('_')[1].replace('x', ''))
-        sl_mult = 1.0 if target_val <= 5 else 3.0
-        r_r_ratio = target_val / sl_mult
+        timestamp_utc = df_current_features.index[0].tz_localize(timezone.utc)
+        timestamp_local = timestamp_utc + VENEZUELA_TZ_OFFSET
         
-        message = f"""
-        🚨 ML SIGNAL ALERT! 🚨
-        ------------------------------------------
-        ⌚ Time (Local): {timestamp_local.strftime('%Y-%m-%d %H:%M')}
-        🚀 Direction: {direction}
-        🎯 Best Target: {best_target} (R:R {r_r_ratio:.1f}:1)
-        📊 P. Prediction: {best_prob:.2f}%
-        🟢 Net Advantage: +{max_advantage:.2f}%
-        ------------------------------------------
-        RSI: {rsi_value:.2f} | Slope 50: {features['Slope_50']:.2f} | ATR 14: {atr_value:.2f}
-        """
-        print(message)
+        # Use formatting function for alert message
+        alert_message = format_prediction_result(df_current_features.iloc[0], prediction_metrics, timestamp_local, symbol, source)
 
-        # Use internal function
-        _send_telegram_alert_internal(message)
-        return True # <-- Signal found and sent
-
+        print(f"--- ✅ ALERT SENT: Net Advantage {max_advantage:.2f}% ---")
+        
+        # Call the new ASYNC sender
+        alert_success = await _send_telegram_alert_internal(alert_message)
+        
+        return alert_success # <-- Return success of the alert send
+    
     else:
-        print(f"🟡 Prediction found ({best_target}), but Net Advantage ({max_advantage:.2f}%) is below the alert threshold ({MINIMUM_ADVANTAGE_ALERT:.2f}%).")
+        # Signal rejected - logs internally but remains SILENT on Telegram
+        print(f"🟡 Prediction found ({prediction_metrics['best_target']}), but Net Advantage ({max_advantage:.2f}%) is below the alert threshold ({MINIMUM_ADVANTAGE_ALERT:.2f}%).")
         return False # <-- Signal rejected
 
-
-async def main():
+# Main Orchestration function (now ASYNC to allow awaiting IO operations)
+async def run_scanner_main(source: str = 'SCHEDULED'):
     """
-    Orchestrates the live scanner process: loads models, fetches data, 
-    processes features, and triggers predictions/alerts.
-    
-    Returns:
-        bool: True if an alert was sent, False otherwise.
+    Orchestrates the live scanner process (used by the scheduler and webhooks).
     """
     print("--- ⏳ Initializing Live Market Scanner ---")
     
-    # 1. Load the "Brain"
     models = load_all_models()
     if not models:
         return False
         
-    # 2. Fetch Data Context (API Simulation)
-    df_ohlcv_context = fetch_live_data_simulation()
-    if df_ohlcv_context.empty:
-        return False
-
-    # 3. Process the 5 Features of the last candle
-    df_current_features = process_live_features(df_ohlcv_context)
+    symbol_to_scan = 'ETH/USDT'
     
-    # 4. Predict and Alert
-    alert_sent = await predict_and_alert(df_current_features, models)
+    # Run CPU/IO bound tasks in a separate thread to prevent blocking the event loop
+    df_current_features = await asyncio.to_thread(fetch_and_process_features, symbol_to_scan, '1h', 100)
     
-    # --- HEARTBEAT LOGIC (ONLY if no signal was sent) ---
-    if not alert_sent:
-        
-        # Get current time in UTC, then convert to local time (UTC-4)
-        current_time_utc = datetime.now(timezone.utc)
-        current_time_local = current_time_utc + VENEZUELA_TZ_OFFSET
-
-        # Check if the local time is within the 8 AM (8) to 10 PM (22) window
-        is_daytime_window = 8 <= current_time_local.hour < 22
-        
-        if is_daytime_window:
-            heartbeat_message = (
-                f"🟢 **Scanner Status: OK** (Local Time)\n"
-                f"No high-probability signal (>70.0%) found at {current_time_local.strftime('%Y-%m-%d %H:%M:%S')} VET."
-            )
-            # Use internal function
-            _send_telegram_alert_internal(heartbeat_message)
-        else:
-            print("🤫 Silent mode active: No signal found and outside 8 AM - 10 PM window.")
-    
-    # --------------------------------------------------
+    # Run async network task (alerting) in the event loop
+    alert_sent = await predict_and_alert(df_current_features, models, symbol_to_scan, source)
     
     print("--- ✅ Scan Complete. ---")
     
     return alert_sent
-
-if __name__ == '__main__':
-    import asyncio
-    asyncio.run(main())
