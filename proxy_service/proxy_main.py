@@ -12,6 +12,11 @@ app = FastAPI(title="Telegram Proxy Service")
 class AlertPayload(BaseModel):
     message: str
 
+@app.get("/")
+async def root_health_check():
+    """Endpoint de salud simple para la ruta raíz (/)."""
+    return {"status": "ok", "service": "Telegram Proxy"}
+
 @app.post("/send_alert")
 async def proxy_telegram_alert(payload: AlertPayload):
     """Receives alert message and forwards it to the Telegram API."""
@@ -41,9 +46,9 @@ async def proxy_telegram_alert(payload: AlertPayload):
         print(f"❌ Proxy ERROR: {error_detail}")
         return {"status": "error", "detail": error_detail}
 
-# --- NUEVO ENDPOINT PARA KEEP-ALIVE ---
+# --- ENDPOINT PARA KEEP-ALIVE ---
 @app.get("/keep_alive")
 async def keep_alive():
-    """Endpoint de ping para evitar que el proxy entre en modo de suspensión."""
+    """Ping endpoint to prevent the proxy from entering sleep mode."""
     print("🟢 Proxy: Ping keep-alive recibido.")
     return {"status": "success", "detail": "Proxy está activo y responde."}
